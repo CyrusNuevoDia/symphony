@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import re
 import shutil
 from pathlib import Path
+from subprocess import CalledProcessError
 from typing import Protocol
+
+import anyio
 
 from .logging import get_logger
 
@@ -73,7 +75,7 @@ async def ensure_worktree(issue: Issue, settings: Settings) -> Path:
                 workspace.rmdir()
             else:
                 raise FileExistsError(f"workspace path already exists: {workspace}")
-        await _run_command("git", "worktree", "add", str(workspace), cwd=Path.cwd())
+        await _run_command("git", "worktree", "add", str(workspace))
         created_now = True
     else:
         created_now = not workspace.exists()
@@ -104,7 +106,7 @@ async def cleanup_worktree(issue: Issue, settings: Settings) -> None:
         )
 
     if await _is_git_worktree(workspace):
-        await _run_command("git", "worktree", "remove", "--force", str(workspace), cwd=Path.cwd())
+        await _run_command("git", "worktree", "remove", "--force", str(workspace))
     elif workspace.is_dir():
         shutil.rmtree(workspace)
     else:
@@ -149,7 +151,7 @@ async def _is_git_worktree(workspace: Path) -> bool:
         return False
     try:
         stdout, _ = await _run_command(
-            "git", "-C", str(workspace), "rev-parse", "--is-inside-work-tree", cwd=Path.cwd()
+            "git", "-C", str(workspace), "rev-parse", "--is-inside-work-tree"
         )
     except RuntimeError:
         return False
@@ -160,7 +162,7 @@ async def _discard_workspace(workspace: Path) -> None:
     if not workspace.exists():
         return
     if await _is_git_worktree(workspace) and _cwd_has_git_dir():
-        await _run_command("git", "worktree", "remove", "--force", str(workspace), cwd=Path.cwd())
+        await _run_command("git", "worktree", "remove", "--force", str(workspace))
         return
     if workspace.is_dir():
         shutil.rmtree(workspace)
@@ -168,19 +170,17 @@ async def _discard_workspace(workspace: Path) -> None:
         workspace.unlink()
 
 
-async def _run_command(*args: str, cwd: Path) -> tuple[str, str]:
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+async def _run_command(*args: str) -> tuple[str, str]:
+    try:
+        result = await anyio.run_process(list(args), check=True)
+    except CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace").strip()
+        stdout = (exc.stdout or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(stderr or stdout or f"command failed: {' '.join(args)}") from exc
+    return (
+        result.stdout.decode("utf-8", errors="replace"),
+        result.stderr.decode("utf-8", errors="replace"),
     )
-    stdout_bytes, stderr_bytes = await process.communicate()
-    stdout = stdout_bytes.decode("utf-8", errors="replace")
-    stderr = stderr_bytes.decode("utf-8", errors="replace")
-    if process.returncode != 0:
-        raise RuntimeError(stderr.strip() or stdout.strip() or f"command failed: {' '.join(args)}")
-    return stdout, stderr
 
 
 async def _run_hook(
@@ -193,21 +193,15 @@ async def _run_hook(
         workspace=str(workspace),
         issue_identifier=issue.identifier,
     )
-    process = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(workspace),
-        env=_hook_env(workspace, issue),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(),
-            timeout=timeout_ms / 1000,
-        )
+        with anyio.fail_after(timeout_ms / 1000):
+            result = await anyio.run_process(
+                command,
+                cwd=str(workspace),
+                env=_hook_env(workspace, issue),
+                check=False,
+            )
     except TimeoutError as exc:
-        process.kill()
-        await process.wait()
         logger.warning(
             "workspace.hook.timed_out",
             hook=hook_name,
@@ -217,19 +211,19 @@ async def _run_hook(
         )
         raise TimeoutError(f"{hook_name} hook timed out after {timeout_ms}ms") from exc
 
-    stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
-    stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+    stdout = result.stdout.decode("utf-8", errors="replace").strip()
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
     logger.info(
         "workspace.hook.finished",
         hook=hook_name,
         workspace=str(workspace),
         issue_identifier=issue.identifier,
-        returncode=process.returncode,
+        returncode=result.returncode,
         stdout=stdout,
         stderr=stderr,
     )
-    if process.returncode != 0:
-        raise RuntimeError(f"{hook_name} hook failed with exit code {process.returncode}")
+    if result.returncode != 0:
+        raise RuntimeError(f"{hook_name} hook failed with exit code {result.returncode}")
 
 
 def _hook_env(workspace: Path, issue: Issue) -> dict[str, str]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import ClassVar
 
+import anyio
 import pytest
 from codex_app_server_sdk import ChatResult, ConversationStep
 from fastactor import Runtime
@@ -39,6 +40,7 @@ class FakeCodexSession:
     async def run_turn(self, prompt: str, on_event=None) -> ChatResult:
         type(self).run_calls += 1
         type(self).prompts.append(prompt)
+        await anyio.sleep(0)
         for index in range(2):
             step = ConversationStep(
                 thread_id=self._thread_id,

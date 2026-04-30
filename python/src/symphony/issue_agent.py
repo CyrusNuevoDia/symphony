@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Protocol, cast
 
 from codex_app_server_sdk import ConversationStep
-from fastactor.otp import Continue, GenServer, Shutdown
+from fastactor.otp import Continue, GenServer, Stop
 
 from symphony.codex_session import CodexSession
 from symphony.config import Settings
@@ -56,7 +55,7 @@ class IssueAgent(GenServer):
         await self.session.start()
         return Continue("first_turn")
 
-    async def handle_continue(self, term: object) -> Continue | None:
+    async def handle_continue(self, term: object) -> Continue | Stop | None:
         if term not in {"first_turn", "next_turn"}:
             return None
 
@@ -69,9 +68,7 @@ class IssueAgent(GenServer):
         await self.session.run_turn(prompt, on_event=self._forward_event)
         if self.turn < self.settings.agent.max_turns and await self._should_continue():
             return Continue("next_turn")
-        task = asyncio.create_task(self.stop(reason="normal"))
-        task.add_done_callback(self._log_shutdown_task_error)
-        return None
+        return Stop(reason="normal")
 
     async def terminate(self, reason: object) -> None:
         session = getattr(self, "session", None)
@@ -101,11 +98,3 @@ class IssueAgent(GenServer):
         self.issue = refreshed
         active_states = {state.strip().lower() for state in self.settings.tracker.active_states}
         return refreshed.state.strip().lower() in active_states
-
-    def _log_shutdown_task_error(self, task: asyncio.Task[None]) -> None:
-        try:
-            task.result()
-        except Shutdown:
-            return
-        except Exception:
-            logger.exception("issue_agent.shutdown_task_failed", issue_id=self.issue.id)

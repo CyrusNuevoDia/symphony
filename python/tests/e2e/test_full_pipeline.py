@@ -94,9 +94,9 @@ async def test_full_pipeline_reaches_terminal_cleanup(
     )
 
     workspace_root = tmp_path / "workspaces"
-    monkeypatch.setenv("SYMPHONY_WORKSPACE_ROOT", str(workspace_root))
-    monkeypatch.setenv("SYMPHONY_HOOKS_AFTER_CREATE", ":")
-    monkeypatch.setenv("SYMPHONY_HOOKS_BEFORE_REMOVE", ":")
+    monkeypatch.setenv("SYMPHONY_WORKSPACE__ROOT", str(workspace_root))
+    monkeypatch.setenv("SYMPHONY_HOOKS__AFTER_CREATE", ":")
+    monkeypatch.setenv("SYMPHONY_HOOKS__BEFORE_REMOVE", ":")
 
     tracker = MemoryTracker()
     issue = Issue(

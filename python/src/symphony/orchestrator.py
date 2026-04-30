@@ -7,8 +7,7 @@ from datetime import UTC, datetime
 from typing import cast
 
 import anyio
-from anyio.abc import TaskGroup, TaskStatus
-from fastactor.otp import Call, Cast, Down, DynamicSupervisor, GenServer, Info
+from fastactor.otp import Call, Cast, Down, DynamicSupervisor, GenServer, Info, TimerRef
 from fastactor.otp.process import Process
 
 from symphony.config import Settings
@@ -74,7 +73,7 @@ class RetryEntry:
     attempt: int
     kind: str
     scheduled_at_ms: int
-    cancel_scope: anyio.CancelScope | None = None
+    timer_ref: TimerRef | None = None
 
 
 @dataclass(slots=True)
@@ -90,7 +89,6 @@ class RunningEntry:
 @dataclass(slots=True)
 class State:
     settings: Settings
-    tick_token: int = 0
     poll_in_progress: bool = False
     running: dict[str, RunningEntry] = field(default_factory=dict)
     claimed: set[str] = field(default_factory=set)
@@ -122,19 +120,15 @@ class Orchestrator(GenServer[object, object]):
         self.registry = registry
         self.state = State(settings=settings)
         self.workflow = Workflow(config={}, prompt_template="")
-        self._tick_cancel_scope: anyio.CancelScope | None = None
-        self._timer_group = anyio.create_task_group()
-        await self._timer_group.__aenter__()
-        self._next_tick_token = 0
 
         await self._refresh_runtime_config()
         await self._run_terminal_workspace_cleanup()
-        await self._schedule_tick(0)
+        self._schedule_tick(0)
 
     async def handle_info(self, message: Info) -> None:
         match message:
-            case Info(message=("tick", int() as token)):
-                await self._handle_tick(token)
+            case Info(message="tick"):
+                await self._handle_tick()
             case Info(message=("retry", str() as issue_id, int() as attempt)):
                 await self._handle_retry(issue_id, attempt)
             case _:
@@ -149,7 +143,6 @@ class Orchestrator(GenServer[object, object]):
                 return await self._refresh_issue_for_agent(issue_id)
             case "snapshot":
                 return {
-                    "tick_token": self.state.tick_token,
                     "poll_in_progress": self.state.poll_in_progress,
                     "running": sorted(self.state.running),
                     "claimed": sorted(self.state.claimed),
@@ -180,27 +173,14 @@ class Orchestrator(GenServer[object, object]):
                 return None
 
     async def on_terminate(self, reason: object) -> None:
-        self._cancel_tick()
         for issue_id in list(self.state.retry_attempts):
             self._cancel_retry(issue_id)
         for issue_id in list(self.state.running):
             await self._terminate_running_issue(issue_id, cleanup_workspace=False)
-        timer_group: TaskGroup | None = getattr(self, "_timer_group", None)
-        if timer_group is not None:
-            self._timer_group = None
-            timer_group.cancel_scope.cancel()
-            await timer_group.__aexit__(None, None, None)
         logger.info("orchestrator.terminated", reason=reason)
 
-    async def _handle_tick(self, token: int) -> None:
-        # Port of the stale tick-token drop from orchestrator.ex lines 74-117.
-        if token != self.state.tick_token:
-            return
-
-        self.state.tick_token = 0
+    async def _handle_tick(self) -> None:
         self.state.poll_in_progress = True
-        self._tick_cancel_scope = None
-
         try:
             await self._refresh_runtime_config()
             await self._poll_and_dispatch()
@@ -208,7 +188,7 @@ class Orchestrator(GenServer[object, object]):
             logger.exception("orchestrator.poll_failed")
         finally:
             self.state.poll_in_progress = False
-            await self._schedule_tick(self.state.settings.polling.interval_ms)
+            self._schedule_tick(self.state.settings.polling.interval_ms)
 
     async def _handle_retry(self, issue_id: str, attempt: int) -> None:
         retry_entry = self.state.retry_attempts.get(issue_id)
@@ -234,7 +214,6 @@ class Orchestrator(GenServer[object, object]):
 
         running_entry = self.state.running.pop(issue_id)
         self.state.claimed.discard(issue_id)
-        self._delete_child_spec(issue_id)
 
         if _is_normal_shutdown_reason(down.reason):
             self.state.completed.add(issue_id)
@@ -407,7 +386,6 @@ class Orchestrator(GenServer[object, object]):
         if not self._dispatch_slots_available(refreshed_issue):
             return False
 
-        self._delete_child_spec(issue.id)
         child_spec = DynamicSupervisor.child_spec(
             issue.id,
             IssueAgent,
@@ -435,7 +413,6 @@ class Orchestrator(GenServer[object, object]):
             return False
 
         if process.has_stopped():
-            self._delete_child_spec(issue.id)
             reason = process._crash_exc or "normal"
             if _is_normal_shutdown_reason(reason):
                 self.state.completed.add(issue.id)
@@ -472,7 +449,6 @@ class Orchestrator(GenServer[object, object]):
         self._cancel_retry(issue_id)
 
         if running_entry is None:
-            self._delete_child_spec(issue_id)
             return
 
         if cleanup_workspace:
@@ -484,68 +460,26 @@ class Orchestrator(GenServer[object, object]):
 
         with contextlib.suppress(Exception):
             await self.agents_sup.terminate_child(running_entry.child_id)
-        self._delete_child_spec(issue_id)
 
-    async def _schedule_tick(self, delay_ms: int) -> None:
-        self._cancel_tick()
-        self._next_tick_token += 1
-        self.state.tick_token = self._next_tick_token
-        self._tick_cancel_scope = await self._schedule_info_after(
-            delay_ms,
-            ("tick", self._next_tick_token),
-        )
+    def _schedule_tick(self, delay_ms: int) -> None:
+        self.reschedule("tick", delay_ms, "tick")
 
     async def _schedule_retry(self, issue_id: str, attempt: int, *, kind: str) -> None:
         self._cancel_retry(issue_id)
         delay_ms = retry_delay(attempt, kind=kind, settings=self.state.settings)
-        cancel_scope = await self._schedule_info_after(delay_ms, ("retry", issue_id, attempt))
+        timer_ref = self.send_after(delay_ms, ("retry", issue_id, attempt))
         self.state.retry_attempts[issue_id] = RetryEntry(
             issue_id=issue_id,
             attempt=attempt,
             kind=kind,
             scheduled_at_ms=_monotonic_ms() + delay_ms,
-            cancel_scope=cancel_scope,
+            timer_ref=timer_ref,
         )
-
-    async def _schedule_info_after(
-        self,
-        delay_ms: int,
-        payload: object,
-    ) -> anyio.CancelScope:
-        timer_group = self._timer_group
-        if timer_group is None:
-            raise RuntimeError("orchestrator timer group is not running")
-        return await timer_group.start(self._timer_task, delay_ms, payload)
-
-    async def _timer_task(
-        self,
-        delay_ms: int,
-        payload: object,
-        *,
-        task_status: TaskStatus[anyio.CancelScope],
-    ) -> None:
-        with anyio.CancelScope() as cancel_scope:
-            task_status.started(cancel_scope)
-            with anyio.move_on_after(max(delay_ms, 0) / 1000) as timeout_scope:
-                await anyio.sleep_forever()
-            if timeout_scope.cancelled_caught and not cancel_scope.cancel_called:
-                self.info(payload, sender=self)
-
-    def _cancel_tick(self) -> None:
-        if self._tick_cancel_scope is None:
-            return
-        self._tick_cancel_scope.cancel()
-        self._tick_cancel_scope = None
 
     def _cancel_retry(self, issue_id: str) -> None:
         retry_entry = self.state.retry_attempts.pop(issue_id, None)
-        if retry_entry is not None and retry_entry.cancel_scope is not None:
-            retry_entry.cancel_scope.cancel()
-
-    def _delete_child_spec(self, issue_id: str) -> None:
-        # fastactor keeps completed child specs until they are explicitly deleted.
-        with contextlib.suppress(Exception):
-            self.agents_sup.delete_child(issue_id)
+        if retry_entry is not None and retry_entry.timer_ref is not None:
+            self.cancel_timer(retry_entry.timer_ref)
 
     def _find_issue_id_for_ref(self, monitor_ref: str | None) -> str | None:
         if monitor_ref is None:

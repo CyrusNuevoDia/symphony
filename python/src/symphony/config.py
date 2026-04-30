@@ -1,14 +1,40 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+_ENV_REFERENCE_RE = re.compile(r"^\$([A-Za-z_][A-Za-z0-9_]*)$")
 _DEFAULT_APPROVAL_POLICY = {
     "reject": {"sandbox_approval": True, "rules": True, "mcp_elicitations": True}
 }
+
+
+def _resolve_secret(value: str | None, fallback_env_var: str) -> str | None:
+    """Mirror of `resolve_secret_setting/2` from elixir/.../config/schema.ex.
+
+    - None or empty           -> fallback env var (None if unset/empty)
+    - "$NAME"                 -> NAME; unset -> fallback; "" -> None
+    - any other literal       -> use as-is
+    """
+
+    def _env(name: str) -> str | None:
+        raw = os.environ.get(name)
+        return raw if raw not in (None, "") else None
+
+    if not value:
+        return _env(fallback_env_var)
+    match = _ENV_REFERENCE_RE.match(value)
+    if match is None:
+        return value
+    referenced = os.environ.get(match.group(1))
+    if referenced is None:
+        return _env(fallback_env_var)
+    return None if referenced == "" else referenced
 
 
 def _parse_jsonish(value: Any) -> Any:
@@ -53,6 +79,7 @@ class TrackerConfig(BaseModel):
 
     kind: Literal["linear", "memory"]
     project_slug: str | None = None
+    api_key: str | None = None
     active_states: list[str] = Field(default_factory=lambda: ["Todo", "In Progress"])
     terminal_states: list[str] = Field(
         default_factory=lambda: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
@@ -138,13 +165,35 @@ class CodexConfig(BaseModel):
     @field_validator("approval_policy", "turn_sandbox_policy", mode="before")
     @classmethod
     def _normalize_mapping_fields(cls, value: Any) -> Any:
-        value = _parse_jsonish(value)
-        return _normalize_keys(value)
+        return _normalize_keys(_parse_jsonish(value))
 
     @field_validator("config_overrides", mode="before")
     @classmethod
     def _parse_overrides(cls, value: Any) -> Any:
         return _parse_string_list(value)
+
+
+class _EnvOverlay(BaseSettings):
+    """Reads SYMPHONY_<GROUP>__<FIELD> env vars into per-group dicts.
+
+    Each group is `dict[str, Any]` so any inner key is collected without
+    pre-declaring fields; per-field parsing happens in the matching `*Config`
+    validators when the merged payload is validated.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="SYMPHONY_",
+        env_nested_delimiter="__",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    tracker: dict[str, Any] = Field(default_factory=dict)
+    polling: dict[str, Any] = Field(default_factory=dict)
+    workspace: dict[str, Any] = Field(default_factory=dict)
+    hooks: dict[str, Any] = Field(default_factory=dict)
+    agent: dict[str, Any] = Field(default_factory=dict)
+    codex: dict[str, Any] = Field(default_factory=dict)
 
 
 class Settings(BaseModel):
@@ -160,90 +209,14 @@ class Settings(BaseModel):
     @classmethod
     def from_workflow_config(cls, cfg: dict[str, Any]) -> Settings:
         payload: dict[str, Any] = {
-            "tracker": _normalize_keys(cfg.get("tracker", {})),
-            "polling": _normalize_keys(cfg.get("polling", {})),
-            "workspace": _normalize_keys(cfg.get("workspace", {})),
-            "agent": _normalize_keys(cfg.get("agent", {})),
-            "codex": _normalize_keys(cfg.get("codex", {})),
+            group: _normalize_keys(cfg.get(group, {}))
+            for group in ("tracker", "polling", "workspace", "agent", "codex")
         }
         if "hooks" in cfg:
             payload["hooks"] = _normalize_keys(cfg.get("hooks"))
-        return cls.model_validate(_deep_merge(payload, _EnvOverlay().to_settings_patch()))
-
-
-class _EnvOverlay(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="SYMPHONY_", extra="ignore", case_sensitive=False)
-
-    tracker_kind: Literal["linear", "memory"] | None = None
-    tracker_project_slug: str | None = None
-    tracker_active_states: list[str] | None = None
-    tracker_terminal_states: list[str] | None = None
-    polling_interval_ms: int | None = None
-    workspace_root: str | None = None
-    hooks_after_create: str | None = None
-    hooks_before_remove: str | None = None
-    agent_max_concurrent_agents: int | None = None
-    agent_max_turns: int | None = None
-    agent_max_concurrent_agents_by_state: dict[str, int] | None = None
-    agent_max_retry_backoff_ms: int | None = None
-    codex_command: list[str] | str | None = None
-    codex_approval_policy: str | dict[str, Any] | None = None
-    codex_thread_sandbox: str | None = None
-    codex_turn_sandbox_policy: dict[str, Any] | None = None
-    codex_model: str | None = None
-    codex_config_overrides: list[str] | None = None
-
-    _parse_state_lists = field_validator(
-        "tracker_active_states",
-        "tracker_terminal_states",
-        "codex_config_overrides",
-        mode="before",
-    )(_parse_string_list)
-    _parse_command = field_validator("codex_command", mode="before")(_parse_jsonish)
-    _parse_maps = field_validator(
-        "agent_max_concurrent_agents_by_state",
-        "codex_approval_policy",
-        "codex_turn_sandbox_policy",
-        mode="before",
-    )(_parse_jsonish)
-
-    def to_settings_patch(self) -> dict[str, Any]:
-        patch: dict[str, Any] = {}
-        tracker = {
-            "kind": self.tracker_kind,
-            "project_slug": self.tracker_project_slug,
-            "active_states": self.tracker_active_states,
-            "terminal_states": self.tracker_terminal_states,
-        }
-        polling = {"interval_ms": self.polling_interval_ms}
-        workspace = {"root": self.workspace_root}
-        hooks = {
-            "after_create": self.hooks_after_create,
-            "before_remove": self.hooks_before_remove,
-        }
-        agent = {
-            "max_concurrent_agents": self.agent_max_concurrent_agents,
-            "max_turns": self.agent_max_turns,
-            "max_concurrent_agents_by_state": self.agent_max_concurrent_agents_by_state,
-            "max_retry_backoff_ms": self.agent_max_retry_backoff_ms,
-        }
-        codex = {
-            "command": self.codex_command,
-            "approval_policy": _normalize_keys(self.codex_approval_policy),
-            "thread_sandbox": self.codex_thread_sandbox,
-            "turn_sandbox_policy": _normalize_keys(self.codex_turn_sandbox_policy),
-            "model": self.codex_model,
-            "config_overrides": self.codex_config_overrides,
-        }
-        for name, group in (
-            ("tracker", tracker),
-            ("polling", polling),
-            ("workspace", workspace),
-            ("hooks", hooks),
-            ("agent", agent),
-            ("codex", codex),
-        ):
-            cleaned = {key: value for key, value in group.items() if value is not None}
-            if cleaned:
-                patch[name] = cleaned
-        return patch
+        env_patch = {k: v for k, v in _EnvOverlay().model_dump().items() if v}
+        settings = cls.model_validate(_deep_merge(payload, env_patch))
+        # Mirror elixir/.../config/schema.ex `finalize_settings/1`: resolve `$VAR` refs and
+        # fall back to `LINEAR_API_KEY` when tracker.api_key is unset.
+        settings.tracker.api_key = _resolve_secret(settings.tracker.api_key, "LINEAR_API_KEY")
+        return settings

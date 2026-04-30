@@ -1,12 +1,16 @@
 # ruff: noqa: E501
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import Issue
 
 GRAPHQL_ENDPOINT = "https://api.linear.app/graphql"
 ISSUE_PAGE_SIZE = 50
+
 POLL_QUERY = """
 query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
   issues(filter: {project: {slugId: {eq: $projectSlug}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
@@ -16,41 +20,25 @@ query SymphonyLinearPoll($projectSlug: String!, $stateNames: [String!]!, $first:
       title
       description
       priority
-      state {
-        name
-      }
+      state { name }
       branchName
       url
-      assignee {
-        id
-      }
-      labels {
-        nodes {
-          name
-        }
-      }
+      assignee { id }
+      labels { nodes { name } }
       inverseRelations(first: $relationFirst) {
         nodes {
           type
-          issue {
-            id
-            identifier
-            state {
-              name
-            }
-          }
+          issue { id identifier state { name } }
         }
       }
       createdAt
       updatedAt
     }
-    pageInfo {
-      hasNextPage
-      endCursor
-    }
+    pageInfo { hasNextPage endCursor }
   }
 }
 """
+
 ISSUES_BY_ID_QUERY = """
 query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!) {
   issues(filter: {id: {in: $ids}}, first: $first) {
@@ -60,29 +48,15 @@ query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!)
       title
       description
       priority
-      state {
-        name
-      }
+      state { name }
       branchName
       url
-      assignee {
-        id
-      }
-      labels {
-        nodes {
-          name
-        }
-      }
+      assignee { id }
+      labels { nodes { name } }
       inverseRelations(first: $relationFirst) {
         nodes {
           type
-          issue {
-            id
-            identifier
-            state {
-              name
-            }
-          }
+          issue { id identifier state { name } }
         }
       }
       createdAt
@@ -91,42 +65,119 @@ query SymphonyLinearIssuesById($ids: [ID!]!, $first: Int!, $relationFirst: Int!)
   }
 }
 """
-VIEWER_QUERY = """
-query SymphonyLinearViewer {
-  viewer {
-    id
-  }
-}
-"""
+
+VIEWER_QUERY = "query SymphonyLinearViewer { viewer { id } }"
+
 CREATE_COMMENT_MUTATION = """
 mutation SymphonyCreateComment($issueId: String!, $body: String!) {
-  commentCreate(input: {issueId: $issueId, body: $body}) {
-    success
-  }
+  commentCreate(input: {issueId: $issueId, body: $body}) { success }
 }
 """
+
 UPDATE_STATE_MUTATION = """
 mutation SymphonyUpdateIssueState($issueId: String!, $stateId: String!) {
-  issueUpdate(id: $issueId, input: {stateId: $stateId}) {
-    success
-  }
+  issueUpdate(id: $issueId, input: {stateId: $stateId}) { success }
 }
 """
+
 RESOLVE_STATE_ID_QUERY = """
 query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
   issue(id: $issueId) {
     team {
-      states(filter: {name: {eq: $stateName}}, first: 1) {
-        nodes {
-          id
-        }
-      }
+      states(filter: {name: {eq: $stateName}}, first: 1) { nodes { id } }
     }
   }
 }
 """
+
+
 class LinearTrackerError(RuntimeError):
     pass
+
+
+class _Aliased(BaseModel):
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
+class _State(_Aliased):
+    name: str
+
+
+class _Assignee(_Aliased):
+    id: str
+
+
+class _Label(_Aliased):
+    name: str
+
+
+class _Labels(_Aliased):
+    nodes: list[_Label] = Field(default_factory=list)
+
+
+class _RelatedIssue(_Aliased):
+    id: str
+
+
+class _InverseRelation(_Aliased):
+    type: str | None = None
+    issue: _RelatedIssue
+
+
+class _InverseRelations(_Aliased):
+    nodes: list[_InverseRelation] = Field(default_factory=list)
+
+
+class _IssueNode(_Aliased):
+    id: str
+    identifier: str
+    title: str
+    description: str | None = None
+    priority: int | None = None
+    state: _State
+    branch_name: str | None = Field(default=None, alias="branchName")
+    url: str
+    assignee: _Assignee | None = None
+    labels: _Labels | None = None
+    inverse_relations: _InverseRelations | None = Field(default=None, alias="inverseRelations")
+    created_at: str | None = Field(default=None, alias="createdAt")
+    updated_at: str | None = Field(default=None, alias="updatedAt")
+
+    def to_issue(self) -> Issue:
+        return Issue.model_validate(
+            {
+                "id": self.id,
+                "identifier": self.identifier,
+                "title": self.title,
+                "description": self.description,
+                "priority": self.priority,
+                "state": self.state.name,
+                "branch_name": self.branch_name,
+                "url": self.url,
+                "assignee_id": self.assignee.id if self.assignee else None,
+                "blocked_by": [
+                    rel.issue.id
+                    for rel in (self.inverse_relations.nodes if self.inverse_relations else [])
+                    if (rel.type or "").strip().lower() == "blocks"
+                ],
+                "labels": [label.name.lower() for label in (self.labels.nodes if self.labels else [])],
+                "assigned_to_worker": True,
+                "created_at": self.created_at,
+                "updated_at": self.updated_at,
+            }
+        )
+
+
+class _PageInfo(_Aliased):
+    has_next_page: bool = Field(alias="hasNextPage")
+    end_cursor: str | None = Field(default=None, alias="endCursor")
+
+
+class _IssueConnection(_Aliased):
+    nodes: list[_IssueNode] = Field(default_factory=list)
+    page_info: _PageInfo | None = Field(default=None, alias="pageInfo")
+
+
 class LinearTracker:
     def __init__(
         self,
@@ -144,11 +195,14 @@ class LinearTracker:
         self._client = client or httpx.AsyncClient()
         self._owns_client = client is None
         self._viewer_checked = False
+
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
     async def fetch_candidate_issues(self) -> list[Issue]:
         return await self.fetch_issues_by_states(self._active_states)
+
     async def fetch_issues_by_states(self, state_names: list[str]) -> list[Issue]:
         states = list(dict.fromkeys(state_names))
         if not states:
@@ -167,12 +221,15 @@ class LinearTracker:
                     "after": after,
                 },
             )
-            connection = self._require_mapping(data.get("issues"), "data.issues")
-            issues.extend(self._parse_nodes(connection.get("nodes"), "data.issues.nodes"))
-            page = self._require_mapping(connection.get("pageInfo"), "data.issues.pageInfo")
-            if not self._require_bool(page.get("hasNextPage"), "data.issues.pageInfo.hasNextPage"):
+            connection = _IssueConnection.model_validate(data.get("issues") or {})
+            issues.extend(node.to_issue() for node in connection.nodes)
+            page = connection.page_info
+            if page is None or not page.has_next_page:
                 return issues
-            after = self._require_str(page.get("endCursor"), "data.issues.pageInfo.endCursor")
+            if not page.end_cursor:
+                raise LinearTrackerError("missing or invalid data.issues.pageInfo.endCursor")
+            after = page.end_cursor
+
     async def fetch_issue_states_by_ids(self, issue_ids: list[str]) -> list[Issue]:
         ids = list(dict.fromkeys(issue_ids))
         if not ids:
@@ -186,14 +243,16 @@ class LinearTracker:
                 ISSUES_BY_ID_QUERY,
                 {"ids": batch, "first": len(batch), "relationFirst": ISSUE_PAGE_SIZE},
             )
-            connection = self._require_mapping(data.get("issues"), "data.issues")
-            issues.extend(self._parse_nodes(connection.get("nodes"), "data.issues.nodes"))
+            connection = _IssueConnection.model_validate(data.get("issues") or {})
+            issues.extend(node.to_issue() for node in connection.nodes)
         issues.sort(key=lambda issue: order.get(issue.id, len(order)))
         return issues
+
     async def create_comment(self, issue_id: str, body: str) -> None:
         await self._ensure_authenticated()
         data = await self._graphql(CREATE_COMMENT_MUTATION, {"issueId": issue_id, "body": body})
-        self._expect_success(data, "commentCreate", "Linear commentCreate did not succeed")
+        self._expect_success(data, "commentCreate")
+
     async def update_issue_state(self, issue_id: str, state_name: str) -> None:
         await self._ensure_authenticated()
         state_id = await self._resolve_state_id(issue_id, state_name)
@@ -201,29 +260,32 @@ class LinearTracker:
             UPDATE_STATE_MUTATION,
             {"issueId": issue_id, "stateId": state_id},
         )
-        self._expect_success(data, "issueUpdate", "Linear issueUpdate did not succeed")
+        self._expect_success(data, "issueUpdate")
+
     async def _ensure_authenticated(self) -> None:
         if self._viewer_checked:
             return
         data = await self._graphql(VIEWER_QUERY, {})
-        viewer = self._require_mapping(data.get("viewer"), "data.viewer")
-        self._require_str(viewer.get("id"), "data.viewer.id")
+        viewer = data.get("viewer") or {}
+        if not isinstance(viewer, dict) or not viewer.get("id"):
+            raise LinearTrackerError("missing or invalid data.viewer.id")
         self._viewer_checked = True
+
     async def _resolve_state_id(self, issue_id: str, state_name: str) -> str:
-        data = await self._graphql(
+        data: Any = await self._graphql(
             RESOLVE_STATE_ID_QUERY,
             {"issueId": issue_id, "stateName": state_name},
         )
-        issue = self._require_mapping(data.get("issue"), "data.issue")
-        team = self._require_mapping(issue.get("team"), "data.issue.team")
-        states = self._require_mapping(team.get("states"), "data.issue.team.states")
-        nodes = self._require_list(states.get("nodes"), "data.issue.team.states.nodes")
-        if not nodes:
+        try:
+            state_id = data["issue"]["team"]["states"]["nodes"][0]["id"]
+        except (KeyError, IndexError, TypeError) as exc:
             raise LinearTrackerError(
                 f"Linear state {state_name!r} was not found for issue {issue_id!r}"
-            )
-        state = self._require_mapping(nodes[0], "data.issue.team.states.nodes[0]")
-        return self._require_str(state.get("id"), "data.issue.team.states.nodes[0].id")
+            ) from exc
+        if not isinstance(state_id, str) or not state_id:
+            raise LinearTrackerError(f"invalid state id for {state_name!r}")
+        return state_id
+
     async def _graphql(self, query: str, variables: dict[str, object]) -> dict[str, object]:
         response = await self._client.post(
             GRAPHQL_ENDPOINT,
@@ -231,109 +293,17 @@ class LinearTracker:
             json={"query": query, "variables": variables},
         )
         response.raise_for_status()
-        payload = self._require_mapping(response.json(), "response")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise LinearTrackerError("response is not a JSON object")
         if isinstance(payload.get("errors"), list) and payload["errors"]:
             raise LinearTrackerError(f"Linear GraphQL errors: {payload['errors']!r}")
-        return self._require_mapping(payload.get("data"), "response.data")
-    def _expect_success(self, data: dict[str, object], field: str, message: str) -> None:
-        if self._require_mapping(data.get(field), f"data.{field}").get("success") is not True:
-            raise LinearTrackerError(message)
-    def _parse_nodes(self, nodes: object, field_name: str) -> list[Issue]:
-        return [self._normalize_issue(node) for node in self._require_list(nodes, field_name)]
-    def _normalize_issue(self, issue: object) -> Issue:
-        payload = self._require_mapping(issue, "issue")
-        state = self._require_mapping(payload.get("state"), "issue.state")
-        assignee = payload.get("assignee")
-        assignee_map = None if assignee is None else self._require_mapping(assignee, "issue.assignee")
-        assignee_id = None
-        if assignee_map is not None:
-            assignee_id = self._optional_str(assignee_map.get("id"), "issue.assignee.id")
-        return Issue.model_validate(
-            {
-                "id": self._require_str(payload.get("id"), "issue.id"),
-                "identifier": self._require_str(payload.get("identifier"), "issue.identifier"),
-                "title": self._require_str(payload.get("title"), "issue.title"),
-                "description": self._optional_str(payload.get("description"), "issue.description"),
-                "priority": self._optional_int(payload.get("priority"), "issue.priority"),
-                "state": self._require_str(state.get("name"), "issue.state.name"),
-                "branch_name": self._optional_str(payload.get("branchName"), "issue.branchName"),
-                "url": self._require_str(payload.get("url"), "issue.url"),
-                "assignee_id": assignee_id,
-                "blocked_by": self._extract_blockers(payload.get("inverseRelations")),
-                "labels": self._extract_labels(payload.get("labels")),
-                "assigned_to_worker": True,
-                "created_at": self._optional_str(payload.get("createdAt"), "issue.createdAt"),
-                "updated_at": self._optional_str(payload.get("updatedAt"), "issue.updatedAt"),
-            }
-        )
-    def _extract_labels(self, labels: object) -> list[str]:
-        if labels is None:
-            return []
-        nodes = self._require_list(
-            self._require_mapping(labels, "issue.labels").get("nodes"),
-            "issue.labels.nodes",
-        )
-        return [
-            self._require_str(
-                self._require_mapping(node, "issue.labels.nodes[]").get("name"),
-                "issue.labels.nodes[].name",
-            ).lower()
-            for node in nodes
-        ]
-    def _extract_blockers(self, inverse_relations: object) -> list[str]:
-        if inverse_relations is None:
-            return []
-        nodes = self._require_list(
-            self._require_mapping(inverse_relations, "issue.inverseRelations").get("nodes"),
-            "issue.inverseRelations.nodes",
-        )
-        blocked_by: list[str] = []
-        for node in nodes:
-            relation = self._require_mapping(node, "issue.inverseRelations.nodes[]")
-            relation_type = self._optional_str(
-                relation.get("type"),
-                "issue.inverseRelations.nodes[].type",
-            )
-            if relation_type is None or relation_type.strip().lower() != "blocks":
-                continue
-            blocker = self._require_mapping(
-                relation.get("issue"),
-                "issue.inverseRelations.nodes[].issue",
-            )
-            blocked_by.append(
-                self._require_str(
-                    blocker.get("id"),
-                    "issue.inverseRelations.nodes[].issue.id",
-                )
-            )
-        return blocked_by
-    @staticmethod
-    def _require_mapping(value: object, field_name: str) -> dict[str, object]:
-        if isinstance(value, dict):
-            return value
-        raise LinearTrackerError(f"missing or invalid {field_name}")
-    @staticmethod
-    def _require_list(value: object, field_name: str) -> list[object]:
-        if isinstance(value, list):
-            return value
-        raise LinearTrackerError(f"missing or invalid {field_name}")
-    @staticmethod
-    def _require_bool(value: object, field_name: str) -> bool:
-        if isinstance(value, bool):
-            return value
-        raise LinearTrackerError(f"missing or invalid {field_name}")
-    @staticmethod
-    def _require_str(value: object, field_name: str) -> str:
-        if isinstance(value, str) and value:
-            return value
-        raise LinearTrackerError(f"missing or invalid {field_name}")
-    @staticmethod
-    def _optional_str(value: object, field_name: str) -> str | None:
-        return None if value is None else LinearTracker._require_str(value, field_name)
-    @staticmethod
-    def _optional_int(value: object, field_name: str) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise LinearTrackerError(f"missing or invalid {field_name}")
-        return value
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            raise LinearTrackerError("missing or invalid response.data")
+        return data
+
+    def _expect_success(self, data: dict[str, object], field: str) -> None:
+        result = data.get(field)
+        if not isinstance(result, dict) or result.get("success") is not True:
+            raise LinearTrackerError(f"Linear {field} did not succeed")

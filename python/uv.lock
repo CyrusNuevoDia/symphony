@@ -145,7 +145,7 @@ wheels = [
 [[package]]
 name = "fastactor"
 version = "0.1.0"
-source = { git = "https://github.com/CyrusNuevoDia/fastactor?rev=main#ae3f82ab693d55f61bbe61edc84cd5c4fac68da0" }
+source = { git = "https://github.com/CyrusNuevoDia/fastactor?rev=main#62f4cf90f0b6df2e1b11f2f13f4ab2f0a0ef7797" }
 dependencies = [
     { name = "anyio" },
     { name = "beartype" },

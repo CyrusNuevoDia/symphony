@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import cast
@@ -33,9 +32,12 @@ def build_tracker(
         return MemoryTracker()
     if settings.tracker.kind != "linear":
         raise ValueError(f"unsupported tracker kind: {settings.tracker.kind!r}")
-    api_key = os.environ.get("LINEAR_API_KEY")
+    api_key = settings.tracker.api_key
     if not api_key:
-        raise RuntimeError("LINEAR_API_KEY is required for the Linear tracker")
+        raise RuntimeError(
+            "tracker.api_key is required for the Linear tracker "
+            "(set LINEAR_API_KEY in the environment or `tracker.api_key` in WORKFLOW.md)"
+        )
     project_slug = settings.tracker.project_slug
     if not project_slug:
         raise RuntimeError("tracker.project_slug is required for the Linear tracker")

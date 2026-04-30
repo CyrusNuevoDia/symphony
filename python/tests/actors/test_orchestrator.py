@@ -229,17 +229,6 @@ async def _snapshot(orchestrator: Orchestrator) -> dict[str, object]:
     return cast(dict[str, object], await orchestrator.call("snapshot"))
 
 
-async def _wait_for_scheduled_tick(orchestrator: Orchestrator) -> dict[str, object]:
-    with anyio.fail_after(2.0):
-        while True:
-            snapshot = await _snapshot(orchestrator)
-            if cast(int, snapshot["tick_token"]) and not cast(
-                bool, snapshot["poll_in_progress"]
-            ):
-                return snapshot
-            await anyio.sleep(0.01)
-
-
 @pytest.mark.anyio
 async def test_polling_cycle_dispatches_one_issue(
     monkeypatch: pytest.MonkeyPatch,
@@ -453,45 +442,3 @@ async def test_terminal_state_transition_stops_agent_and_cleans_workspace(
         await _wait_until(lambda: not workspace.exists(), timeout=3.0)
         release.set()
         await _wait_until(lambda: FakeCodexSession.stop_calls.get("ENG-1", 0) == 1, timeout=5.0)
-
-
-@pytest.mark.anyio
-async def test_tick_token_dedupes_stale_ticks(tmp_path: Path) -> None:
-    workflow_path = tmp_path / "WORKFLOW.md"
-    workspace_root = tmp_path / "workspaces"
-    _write_workflow(
-        workflow_path,
-        workspace_root=workspace_root,
-        poll_interval_ms=60_000,
-    )
-
-    tracker = MemoryTracker()
-
-    async with Runtime():
-        orchestrator = await _start_orchestrator(tracker=tracker, workflow_path=workflow_path)
-        snapshot = await _wait_for_scheduled_tick(orchestrator)
-
-        calls = 0
-        started = anyio.Event()
-        release = anyio.Event()
-        original_fetch = tracker.fetch_candidate_issues
-
-        async def slow_fetch() -> list[Issue]:
-            nonlocal calls
-            calls += 1
-            started.set()
-            await release.wait()
-            return await original_fetch()
-
-        tracker.fetch_candidate_issues = slow_fetch  # type: ignore[method-assign]
-
-        token = cast(int, snapshot["tick_token"])
-        orchestrator.info(("tick", token), sender=orchestrator)
-        orchestrator.info(("tick", token), sender=orchestrator)
-
-        await started.wait()
-        release.set()
-        await _wait_until(lambda: calls == 1)
-        await anyio.sleep(0.05)
-
-        assert calls == 1
